@@ -1,0 +1,36 @@
+# 运行时产物（训练权重 / 对局数据分片 / 日志）
+runs/
+data/
+logs/
+
+# 第三方二进制（Stockfish 需自行获取，勿入公网仓库）
+tools/stockfish
+
+# SSH 主机密钥等基础设施文件
+*.known_hosts
+
+# 模型权重与数据分片
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.npz
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# 备份文件
+*.orig
+*.bak
+*.before-*
+*.before_*
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
