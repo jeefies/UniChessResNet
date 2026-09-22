@@ -1,7 +1,15 @@
 # 运行时产物（训练权重 / 对局数据分片 / 日志）
 runs/
-data/
 logs/
+
+# data/ 下只挡数据本身，**不能整目录挡**。data/ 里同时放着源码
+# （record.py 定义定长记录格式、build_evals.py 造分片、download*.sh 拉数据），
+# 原先一条 `data/` 把它们一起排除掉了，于是 clone 出来的仓库连
+# model/dataset.py 都 import 不了（No module named 'data'）。
+data/raw/
+data/shards*/
+data/*.bin
+data/*.txt
 
 # 第三方二进制（Stockfish 需自行获取，勿入公网仓库）
 tools/stockfish
