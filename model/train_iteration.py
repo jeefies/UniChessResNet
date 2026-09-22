@@ -14,7 +14,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from data.record import RECORD_DTYPE
 from model.dataset import decode_batch, decode_targets
-from model.net import NetConfig, UniChessNet, count_params
+from model.net import NetConfig, UniChessNet, count_params, cfg_conflicts
 
 
 def save_atomic(obj, path):
@@ -116,7 +116,10 @@ def main():
     rng=np.random.default_rng(20260909);step=0;best=float('inf')
     if args.resume:
         ck=torch.load(out/'latest.pt',map_location='cpu',weights_only=False)
-        assert ck['cfg']==cfg.__dict__
+        # 不能直接比字典：NetConfig 后加过字段，老 checkpoint 没有这些 key，
+        # 直接相等判断会让每个旧 run 的 --resume 都挂掉，而结构其实没变。
+        bad = cfg_conflicts(ck['cfg'], cfg)
+        assert not bad, '网络结构与 checkpoint 不符：' + '；'.join(bad)
         assert ck['args']['steps']==args.steps and ck['args']['batch']==args.batch and ck['args']['accum']==args.accum
         model.load_state_dict(ck['model']);opt.load_state_dict(ck['optimizer'])
         step=ck['step'];best=ck['best'];rng.bit_generator.state=ck['rng']

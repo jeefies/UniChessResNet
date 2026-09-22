@@ -1,18 +1,23 @@
 """UniChess 策略/价值网络。
 
 结构：ResNet 主干（带 Squeeze-Excitation）+ 三个头
-    policy  1x1 conv C->64  -> (64, 8, 8) -> 展平 4096，索引 = from*64 + to
-    promo   小头，4 维（后/车/象/马）
+    policy  4096 维，索引 = from*64 + to（两种实现，见 NetConfig.policy_head）
+    promo   4 维（后/车/象/马），见 NetConfig.promo_head
     value   1x1 conv C->8 -> FC -> 3 维 WDL
 
-⚠️ 策略头必须是 1x1 conv，参数量仅 C*64 ≈ 12k。
-   若改成 flatten + FC（C*64=12288 -> 4096）会是 5000 万参数，比整个主干还大。
+⚠️ 策略头**不能**做成 flatten + FC：C*64=12288 -> 4096 是 5000 万参数，
+   比整个主干还大。现有两种实现都远在这条线以下（192 通道时约 12k / 29k）：
+     conv      1x1 conv C->64 -> (64, 8, 8) -> 展平（旧，只读落点格）
+     bilinear  <Q[from], K[to]> / sqrt(d) + bias（两端都读，见 BilinearPolicyHead）
+
+⚠️ 改 NetConfig 的字段就会改 `cfg.__dict__`，而 checkpoint 存的就是它。
+   续训的脚本不可以直接比字典相等，必须走 cfg_conflicts()——理由见该函数。
 
 规模是配置项。Stage 1 蒸馏用 15x192，Stage 4 自对弈蒸馏到 10x128（吞吐优先）。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 
 import torch
 import torch.nn as nn
@@ -22,6 +27,33 @@ NUM_PLANES = 19
 POLICY_SIZE = 4096
 PROMO_SIZE = 4
 WDL_SIZE = 3
+
+
+def legal_from_to_mask(x: torch.Tensor) -> torch.Tensor:
+    """从输入平面直接推出策略掩码：[N, 19, 8, 8] -> bool [N, 4096]，索引 from*64+to。
+
+    **这不是精确的合法着法集合，而是它的一个超集**——这正是要点：漏掉一个
+    合法着法会直接把梯度算错，而多留几个非法着法只是少省一点。所以这里只用
+    两条绝对成立、且能从平面 0-5（我方兵马象车后王，见 core/encoding.py 的
+    平面布局）零成本读出的规则：
+
+        1. 起点格必须有我方棋子
+        2. 落点格不能有我方棋子（吃不了自己的子）
+
+    第 2 条要点名易位：python-chess 标准模式下易位是 e1g1 / e1c1，王走两格，
+    落点是空格，不是「王吃己车」的 e1h1（那是 Chess960 的表示）。已在 400 局
+    随机对局、23,317 个局面、716,540 个合法着法上逐一验证过：两条规则
+    **零误杀**。本仓库只下标准棋，换 Chess960 时第 2 条必须重新验。
+
+    实测平均把 4096 维压到 686 维（仅第 1 条是 882 维）。
+
+    为什么这个函数放在 model/ 而不是 core/：它要返回 torch 张量，而 core/ 只
+    依赖 chess + numpy，MCTS 走的是那条路，不能被 torch 污染。core.moves 里
+    已有一个精确版 legal_mask()，但那个要逐着法遍历 python-chess，放进训练
+    热路径就是把 GPU 饿死，而分片里也没存 FEN 可供重建。
+    """
+    ours = x[:, 0:6].amax(dim=1).flatten(1) > 0.5      # [N, 64]，索引 = 格子号
+    return (ours.unsqueeze(2) & (~ours).unsqueeze(1)).flatten(1)
 
 
 @dataclass(frozen=True)
@@ -34,13 +66,16 @@ class NetConfig:
     num_buckets: int = 1       # >1 时启用按子力数分桶的输出头（Stage 2 之后再开）
     policy_head: str = "conv"  # "conv" = 1x1 卷积（旧）；"bilinear" = 双线性（见下）
     policy_dim: int = 64       # 仅 bilinear 用：Q/K 的投影维度
+    promo_head: str = "legacy" # "legacy" = 旧结构；"bn" = 补上归一化（见 UniChessNet）
 
     @property
     def name(self) -> str:
         base = f"{self.blocks}x{self.filters}"
         if self.num_buckets != 1:
             base = f"{base}-b{self.num_buckets}"
-        return base if self.policy_head == "conv" else f"{base}-{self.policy_head}"
+        if self.policy_head != "conv":
+            base = f"{base}-{self.policy_head}"
+        return base if self.promo_head == "legacy" else f"{base}-promo{self.promo_head}"
 
 
 class SqueezeExcitation(nn.Module):
@@ -145,10 +180,39 @@ class UniChessNet(nn.Module):
             self.policy_conv = nn.Conv2d(c, 64 * nb, 1)
         else:
             raise ValueError(f"未知的 policy_head: {self.cfg.policy_head!r}")
-        self.promo_head = nn.Sequential(
-            nn.Conv2d(c, 4, 1), nn.Flatten(), nn.ReLU(inplace=True),
-            nn.Linear(4 * 64, PROMO_SIZE * nb),
-        )
+        # promo：4 类（后/车/象/马）。两种结构，输出都是 [N, nb, 4]。
+        #
+        # legacy 是 Conv2d(c, 4, 1) -> Flatten -> ReLU -> Linear，问题在于
+        # **ReLU 直接作用在没有归一化的原始 conv 输出上**。主干里每一处
+        # ReLU 前面都有 BatchNorm（stem、ResBlock、value_conv 都是），唯独
+        # 这里漏了。后果不是精度差一点，是这个瓶颈只有 4 个通道：某个通道
+        # 的预激活一旦整体落到负半轴，ReLU 恒输出 0、梯度恒为 0，它就永久
+        # 死掉，而死一个就是丢掉这个头四分之一的容量。没有 BN 就没有任何
+        # 机制把它拉回来。
+        #
+        # bn 版补上 BatchNorm2d(4)，顺序改成和 value_conv 完全一致
+        # （conv -> BN -> ReLU -> flatten -> FC），conv 因此去掉 bias（BN 的
+        # beta 承担了这个角色）。
+        #
+        # 属性名分开（promo_head / promo_norm）与 policy 头同理：旧权重的
+        # state_dict 里是 "promo_head.0.weight"/"promo_head.3.*"，加了 BN 之后
+        # 层号和形状都变了，共用名字只会让 runs/stage1 的 checkpoint 以一条
+        # 难读的 shape mismatch 报错，不如直接让 key 对不上。
+        if self.cfg.promo_head == "bn":
+            self.promo_norm = nn.Sequential(
+                nn.Conv2d(c, 4, 1, bias=False),
+                nn.BatchNorm2d(4),
+                nn.ReLU(inplace=True),
+                nn.Flatten(),
+                nn.Linear(4 * 64, PROMO_SIZE * nb),
+            )
+        elif self.cfg.promo_head == "legacy":
+            self.promo_head = nn.Sequential(
+                nn.Conv2d(c, 4, 1), nn.Flatten(), nn.ReLU(inplace=True),
+                nn.Linear(4 * 64, PROMO_SIZE * nb),
+            )
+        else:
+            raise ValueError(f"未知的 promo_head: {self.cfg.promo_head!r}")
         # value: 1x1 conv 降维 -> FC -> WDL
         self.value_conv = nn.Sequential(
             nn.Conv2d(c, self.cfg.value_channels, 1),
@@ -176,7 +240,9 @@ class UniChessNet(nn.Module):
             policy = self.policy_bilinear(h)
         else:
             policy = self.policy_conv(h).reshape(n, nb, POLICY_SIZE)
-        promo = self.promo_head(h).view(n, nb, PROMO_SIZE)
+        promo_mod = (self.promo_norm if self.cfg.promo_head == "bn"
+                     else self.promo_head)
+        promo = promo_mod(h).view(n, nb, PROMO_SIZE)
         wdl = self.value_fc(self.value_conv(h)).view(n, nb, WDL_SIZE)
 
         if nb == 1:
@@ -189,6 +255,36 @@ class UniChessNet(nn.Module):
         promo = promo.gather(1, idx.expand(n, 1, PROMO_SIZE)).squeeze(1)
         wdl = wdl.gather(1, idx.expand(n, 1, WDL_SIZE)).squeeze(1)
         return policy, promo, wdl
+
+
+def cfg_conflicts(saved: dict, cfg: NetConfig) -> list[str]:
+    """比对 checkpoint 里存的 cfg 与当前 cfg，返回所有不一致处（空列表 = 可以续训）。
+
+    **不能直接写 `saved == cfg.__dict__`**，两个 --resume 的脚本原先就是这么
+    写的。NetConfig 后来加过字段（policy_head / policy_dim / promo_head），
+    老 checkpoint 的 dict 里根本没有这些 key，字典相等判断于是对每一个旧 run
+    都失败——而它们的网络结构其实一个字节都没变，新字段的默认值复刻的正是
+    旧结构。报出来的还是一句没有信息量的 AssertionError。
+
+    规则：
+      * 共有字段：必须逐个相等
+      * checkpoint 缺、当前有：当前值必须等于该字段的默认值（默认值 = 旧结构；
+        不是默认值就说明结构真的改了，那确实不能续训）
+      * checkpoint 有、当前没有：是从更新的版本往回退，一律算冲突
+    """
+    defaults = {f.name: f.default for f in fields(NetConfig)}
+    cur = asdict(cfg)
+    out: list[str] = []
+    for k in sorted(set(saved) | set(cur)):
+        if k not in cur:
+            out.append(f"{k}: checkpoint 有（={saved[k]!r}），当前 NetConfig 已无此字段")
+        elif k not in saved:
+            if cur[k] != defaults.get(k):
+                out.append(f"{k}: checkpoint 无此字段（等同默认值 "
+                           f"{defaults.get(k)!r}），当前为 {cur[k]!r}")
+        elif saved[k] != cur[k]:
+            out.append(f"{k}: checkpoint={saved[k]!r}，当前={cur[k]!r}")
+    return out
 
 
 def count_params(model: nn.Module) -> dict[str, int]:

@@ -16,7 +16,8 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from data.record import RECORD_DTYPE
 from model.dataset import decode_batch, decode_targets
-from model.net import NetConfig, UniChessNet, count_params
+from model.net import (NetConfig, UniChessNet, count_params,
+                       cfg_conflicts, legal_from_to_mask)
 
 
 def save_atomic(obj, path):
@@ -83,11 +84,21 @@ class Pool:
         return [t.pin_memory() if device == 'cpu' else t.to(device) for t in tensors]
 
 
-def loss_for(model, batch):
+def loss_for(model, batch, legal_mask=False):
+    """legal_mask: 策略 softmax 只在合法着法上归一（见 model/net.py 与 model/train.py）。
+
+    **默认关**，与本文件其它默认值的取舍不同，理由是这个脚本支持 --resume：
+    runs/iteration46_20260909 是 2026-09-09 起、可续训的在跑实验，中途换掉
+    损失的归一化口径会让 loss 曲线在续训点断档，best.pt 的比较也就跨不过去。
+    新 run 想用就显式加 --legal-mask；老 run 续训保持字节级一致。
+    """
     x,p,pr,w=batch
+    legal=legal_from_to_mask(x) if legal_mask else None
     with torch.autocast('cuda',dtype=torch.bfloat16):
         pl,prl,wl=model(x)
         has=p.sum(1)>0
+        if legal is not None:
+            pl=pl.float().masked_fill(~legal,-1e4)   # 不可用 -inf：0*-inf=NaN
         lp=(-(p*F.log_softmax(pl.float(),dim=1)).sum(1)*has).sum()/has.sum().clamp_min(1)
         lw=-(w*F.log_softmax(wl.float(),dim=1)).sum(1).mean()
         eligible=pr!=-100
@@ -105,6 +116,8 @@ def main():
     ap.add_argument('--accum',type=int,default=8)
     ap.add_argument('--save-every',type=int,default=1000)
     ap.add_argument('--resume',action='store_true')
+    ap.add_argument('--legal-mask',dest='legal_mask',action='store_true',
+                    help='策略 softmax 只在合法着法上归一（新 run 建议开；默认关是为了不打断 --resume 的损失口径）')
     args=ap.parse_args()
     torch.set_num_threads(4)
     torch.manual_seed(20260909)
@@ -120,7 +133,10 @@ def main():
     rng=np.random.default_rng(20260909);step=0;best=float('inf')
     if args.resume:
         ck=torch.load(out/'latest.pt',map_location='cpu',weights_only=False)
-        assert ck['cfg']==cfg.__dict__
+        # 不能直接比字典：NetConfig 后加过字段，老 checkpoint 没有这些 key，
+        # 直接相等判断会让每个旧 run 的 --resume 都挂掉，而结构其实没变。
+        bad = cfg_conflicts(ck['cfg'], cfg)
+        assert not bad, '网络结构与 checkpoint 不符：' + '；'.join(bad)
         assert ck['args']['steps']==args.steps and ck['args']['batch']*ck['args']['accum']==args.batch*args.accum
         model.load_state_dict(ck['model']);opt.load_state_dict(ck['optimizer'])
         for group in opt.param_groups:
@@ -159,7 +175,7 @@ def main():
         if step+1<args.steps:future=executor.submit(prepare,step+1)
         for cpu_batch in batches:
             batch=[t.to('cuda',non_blocking=True) for t in cpu_batch]
-            loss,lp,lw=loss_for(model,batch)
+            loss,lp,lw=loss_for(model,batch,args.legal_mask)
             (loss/args.accum).backward()
             totals += torch.stack([loss.detach(),lp.detach(),lw.detach()])
         norm=torch.nn.utils.clip_grad_norm_(model.parameters(),2.0)
@@ -175,7 +191,7 @@ def main():
             with torch.no_grad():
                 for mode in ['general','endgame','promotion']:
                     vrng=np.random.default_rng(991)
-                    scores[mode]=float(np.mean([loss_for(model,valid.sample(vrng,128,mode))[0].item() for _ in range(8)]))
+                    scores[mode]=float(np.mean([loss_for(model,valid.sample(vrng,128,mode),args.legal_mask)[0].item() for _ in range(8)]))
             score=float(np.mean(list(scores.values())))
             improved=score<best;best=min(best,score)
             payload={'model':model.state_dict(),'cfg':cfg.__dict__,'step':step,'optimizer':opt.state_dict(),'best':best,'rng':rng.bit_generator.state,'torch_rng':torch.get_rng_state(),'cuda_rng':torch.cuda.get_rng_state_all(),'args':vars(args)}
