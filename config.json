@@ -1,0 +1,33 @@
+{
+  "max_mcts": {
+    "ckpt": "runs/stage1/ckpt_00187578.pt",
+    "mcts_sims": 800,
+    "mcts_batch": 128,
+    "device": "auto",
+    "syzygy_path": "data/raw/syzygy345",
+    "description": "UniChess-ResNet 15x192（完整 MCTS 800 次模拟，最强棋力；相对路径按仓库根目录解析）"
+  },
+  "fast": {
+    "ckpt": "runs/stage1/ckpt_00187578.pt",
+    "mcts_sims": 200,
+    "mcts_batch": 128,
+    "device": "auto",
+    "syzygy_path": "data/raw/syzygy345",
+    "description": "UniChess-ResNet 15x192（MCTS 200 次模拟，兼顾响应速度与棋力）"
+  },
+  "policy": {
+    "ckpt": "runs/stage1/ckpt_00187578.pt",
+    "mcts_sims": 0,
+    "device": "auto",
+    "syzygy_path": "data/raw/syzygy345",
+    "description": "UniChess-ResNet 15x192（无搜索：mcts_sims=0 表示不构造 MCTS，单次前向按策略头直出，残局表与开局书仍生效）"
+  },
+  "cpu": {
+    "ckpt": "runs/stage1/ckpt_00187578.pt",
+    "mcts_sims": 80,
+    "mcts_batch": 128,
+    "device": "cpu",
+    "syzygy_path": "data/raw/syzygy345",
+    "description": "UniChess-ResNet 15x192（纯 CPU 推理，MCTS 80 次模拟；无 GPU 机器用这个预设）"
+  }
+}
