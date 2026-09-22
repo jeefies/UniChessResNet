@@ -20,24 +20,39 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 
 import chess
 import numpy as np
+
+# 这两个 import 原先写在 priors_from_policy 内部（函数作用域）。必须放在模块顶层：
+# 函数作用域的 import 会在**每次调用时**重新经由 sys.modules 按全限定名解析，
+# 于是根目录下的 engine.py 做的导入隔离（见 engine.py 的 _ISOLATED_MODULES 一节）
+# 对它完全无效——服务端同时挂载的 Transformer 仓库会把 'core.encoding' 占住，
+# 调用时拿到的就是对方那套 64 token 编码，无声算错而不是报错。
+# 没有循环依赖：core.encoding 只依赖 chess + numpy，core.moves 只依赖 chess，
+# 两者都不 import search.*。
+from core.encoding import orient_move
+from core.moves import move_to_index, move_to_promo_index
+
+# 带墙钟限制时第一批的模拟数。这一批纯粹是为了测速率，所以要小；
+# 但太小会让每步都多付一次 _collect 的固定开销，8 是个折中。
+DEADLINE_PROBE_SIMS = 8
 
 
 @dataclass
 class MCTSConfig:
     simulations: int = 800
     batch_size: int = 128          # 一次收集多少叶子再批量推理
-    c_puct: float = 1.8            # PUCT 探索常数
+    c_puct: float = 1.8            # 已废弃：实际用的是下面两个，保留仅为兼容旧构造参数
     c_puct_base: float = 19652.0   # cpuct 随访问数缓慢增长（AlphaZero 的做法）
     c_puct_init: float = 1.8
     dirichlet_alpha: float = 0.3   # 国际象棋用 0.3
     dirichlet_eps: float = 0.25
     fpu_reduction: float = 0.2     # 未访问子节点的先验价值折扣
     temperature: float = 0.0       # 0 = 取访问数最大者
-    temp_moves: int = 0            # 前多少步用温度采样（自对弈时设 15）
+    temp_moves: int = 0            # 已废弃：温度衰减由调用方（autoloop/worker.py）自己控制
     virtual_loss: float = 1.0
     tablebase_pieces: int = 5
     claim_draw: bool = False
@@ -81,7 +96,8 @@ class Node:
         return out
 
     def best_child(self, cfg: MCTSConfig) -> int:
-        """PUCT：argmax( Q + c_puct * P * sqrt(sum_N) / (1 + N) )。"""
+        """PUCT：argmax( Q + c * P * sqrt(sum_N) / (1 + N) )，其中 c 由
+        c_puct_base / c_puct_init 随访问数缓慢增长（**不是** cfg.c_puct）。"""
         total = max(self.sum_N, 1)
         c = (math.log((1 + total + cfg.c_puct_base) / cfg.c_puct_base)
              + cfg.c_puct_init)
@@ -109,10 +125,11 @@ class Node:
 
 def priors_from_policy(board: chess.Board, policy: np.ndarray,
                        promo: np.ndarray) -> tuple[list[chess.Move], np.ndarray]:
-    """把 4096 维策略 + 4 维升变头，映射到该局面的合法走法先验上。"""
-    from core.encoding import orient_move
-    from core.moves import move_to_index, move_to_promo_index
+    """把 4096 维策略 + 4 维升变头，映射到该局面的合法走法先验上。
 
+    orient_move / move_to_index / move_to_promo_index 已提升到模块顶层导入，
+    原因见文件头部那段注释。
+    """
     moves = list(board.legal_moves)
     if not moves:
         return [], np.zeros(0, dtype=np.float32)
@@ -147,6 +164,9 @@ class MCTS:
         self.cfg = cfg or MCTSConfig()
         self.tablebase = tablebase
         self.rng = rng or np.random.default_rng()
+        # 上一次搜索实测的「每秒模拟数」。带墙钟限制时用它给第一批定大小——
+        # 复用根节点的那种情况没有根前向可以估，只能靠上一步留下的速率。
+        self._sim_rate: float | None = None
 
     # ---------- 终局 / 残局表 ----------
 
@@ -294,9 +314,11 @@ class MCTS:
     # ---------- 对外 ----------
 
     def search(self, board: chess.Board, simulations: int | None = None,
-               add_noise: bool = False, root: Node | None = None) -> Node:
+               add_noise: bool = False, root: Node | None = None,
+               deadline: float | None = None) -> Node:
         root_reused = root is not None and root.expanded
-        self.last_metrics = {'network_positions': 0, 'network_batches': 0, 'max_depth': 0, 'collisions': 0, 'reused_root': root_reused}
+        t_enter = time.perf_counter()
+        self.last_metrics = {'simulations': 0, 'stopped_early': False, 'network_positions': 0, 'network_batches': 0, 'max_depth': 0, 'collisions': 0, 'reused_root': root_reused}
         cfg = self.cfg
         sims = simulations or cfg.simulations
         root = root or Node()
@@ -325,13 +347,48 @@ class MCTS:
                       + cfg.dirichlet_eps * noise).astype(np.float32)
 
         done = 0
+        t0 = time.perf_counter()
+        # 根节点展开就是一次单局面前向。带墙钟限制时它是循环开始前唯一的
+        # 时间样本，用来给第一批定大小（下面）。复用根节点时没跑这次前向。
+        t_root = t0 - t_enter if not root_reused else 0.0
+        stopped_early = False
         while done < sims:
             want = min(cfg.batch_size, sims - done)
+            if deadline is not None:
+                now = time.perf_counter()
+                if now >= deadline:
+                    stopped_early = True
+                    break
+                left = deadline - now
+                # **批量大小本身必须受时限约束。** 只在批次末尾比对 deadline
+                # 远远不够：那样最少也要跑完一整批，而 CPU 上一批 128 次模拟
+                # 就是十几秒，一批就能把整盘的时间烧光。实测过这个坑——
+                # 2.0s 的预算被一个 8 次模拟的「小」探测批顶到了 2.67s。
+                if done > 0:
+                    want = max(1, min(want, int(done / max(now - t0, 1e-9) * left)))
+                elif self._sim_rate:
+                    # 上一步测过速率，直接用（复用根节点时这是唯一可用的估计）
+                    want = max(1, min(want, int(self._sim_rate * left)))
+                elif t_root > 1e-4:
+                    # 全新的树、也没有历史速率：拿刚付掉的那次根前向当尺子。
+                    # CPU 上小批量近似线性，GPU 上会严重低估吞吐——但只影响
+                    # 第一批，第二批起就换成实测速率了，保守一点不亏。
+                    want = min(want, max(1, int(left / t_root)))
+                    want = min(want, DEADLINE_PROBE_SIMS)
+                else:
+                    want = min(want, DEADLINE_PROBE_SIMS)
             leaves, terminal_sims = self._collect(root, board, want)
             if not leaves and terminal_sims == 0:
                 break
             self._evaluate_and_expand(leaves)
             done += len(leaves) + terminal_sims
+        # 实际消耗的模拟数（含终局/残局表直接结算的那些）。UCI 侧靠它把
+        # 「剩余时间」换算成「模拟次数」——没有实测速率就只能瞎猜一个 nps。
+        self.last_metrics['simulations'] = done
+        self.last_metrics['stopped_early'] = stopped_early
+        spent = time.perf_counter() - t0
+        if done > 0 and spent > 1e-6:
+            self._sim_rate = done / spent
         return root
 
     @staticmethod
@@ -349,8 +406,10 @@ class MCTS:
 
     def best_move(self, board: chess.Board, simulations: int | None = None,
                   temperature: float | None = None,
-                  add_noise: bool = False, root: Node | None = None) -> tuple[chess.Move, Node]:
-        root = self.search(board, simulations, add_noise=add_noise, root=root)
+                  add_noise: bool = False, root: Node | None = None,
+                  deadline: float | None = None) -> tuple[chess.Move, Node]:
+        root = self.search(board, simulations, add_noise=add_noise, root=root,
+                           deadline=deadline)
         if not root.moves:
             legal = list(board.legal_moves)
             if not legal:
@@ -367,10 +426,19 @@ class MCTS:
                         dtz = abs(self.tablebase.probe_dtz(child))
                     except Exception:
                         dtz = 0 if child.is_game_over() else 1000
-                    # Preserve WDL first; shorten winning DTZ, prolong losing DTZ.
-                    ranked.append((-value, -dtz if value < 0 else dtz, move))
+                    # 排序键 (对手WDL, 清零, 有向DTZ)，取 max：
+                    #   1. -value 最大 = 对手最输 = 我方结果最好，结果永远优先
+                    #   2. **赢棋时清零着法（推兵/吃子）优先**。这一条原先漏了，
+                    #      和 engine/engine.py:152 是同一个理由：DTZ 是「距下一次
+                    #      清零的步数」，兵残局里随时可以推兵，DTZ 就恒在 2 附近，
+                    #      完全不提供梯度——王会原地打转直到 50 步和棋。
+                    #      只在赢棋（value < 0，即对手输）时加权：轮到自己要输或
+                    #      要和的时候，清零反而重置 50 步计数，把能和的棋走输。
+                    #   3. 最后比 DTZ：赢棋取短（-dtz 最大），非赢棋取长。
+                    zeroing = 1 if (value < 0 and board.is_zeroing(move)) else 0
+                    ranked.append((-value, zeroing, -dtz if value < 0 else dtz, move))
                 if ranked and (len(ranked) == len(legal) or max(r[0] for r in ranked) == 1):
-                    return max(ranked, key=lambda r:r[:2])[2], root
+                    return max(ranked, key=lambda r: r[:3])[3], root
                 # Never choose an arbitrary legal move when root TB lacks child DTZ.
                 return MCTS(self.evaluator, self.cfg, rng=self.rng).best_move(
                     board, simulations, temperature, add_noise)

@@ -16,6 +16,7 @@ import json
 import math
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -55,13 +56,13 @@ def policy_topk_accuracy(logits: torch.Tensor, target: torch.Tensor, k: int = 1)
 def build_model(args) -> UniChessNet:
     if args.preset:
         cfg = PRESETS[args.preset]
-        if args.buckets > 1:
-            cfg = NetConfig(blocks=cfg.blocks, filters=cfg.filters,
-                            num_buckets=args.buckets)
     else:
-        cfg = NetConfig(blocks=args.blocks, filters=args.filters,
-                        num_buckets=args.buckets)
-    return UniChessNet(cfg)
+        cfg = NetConfig(blocks=args.blocks, filters=args.filters)
+    # 用 replace 而不是重新构造 NetConfig：原先 --buckets>1 时会把 se_ratio /
+    # value_channels / value_hidden 悄悄退回默认值（AGENTS.md 记过这个坑）。
+    # buckets=1 时两种写法等价，所以这个修正不改变已有行为。
+    return UniChessNet(replace(cfg, num_buckets=args.buckets,
+                               policy_head=args.policy_head))
 
 
 def train(args) -> int:
@@ -159,6 +160,8 @@ def main() -> int:
     ap.add_argument("--blocks", type=int, default=15)
     ap.add_argument("--filters", type=int, default=192)
     ap.add_argument("--buckets", type=int, default=1)
+    ap.add_argument("--policy-head", choices=["conv", "bilinear"], default="conv",
+                    help="策略头：conv=1x1 卷积（旧，只读落点格）；bilinear=双线性（两端都读）")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--epochs", type=int, default=3)

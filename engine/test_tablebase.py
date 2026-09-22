@@ -83,5 +83,23 @@ def main(ckpt: str, tb_path: str, trials: int = 3) -> int:
     return 0 if all_ok else 1
 
 
+def _default_ckpt() -> str:
+    """挑一个实际存在的权重。
+
+    原先写死的是 `runs/smoke/ckpt_00000200.pt`，那个冒烟产物早被清掉了，
+    于是这个测试只会抛 FileNotFoundError——看起来像环境坏了，其实是路径过期。
+    这里改成到 runs/ 下找最新的 ckpt：残局收官靠的是 Syzygy 而不是网络，
+    用哪个权重都测得出来，唯独「哪个权重存在」不该写死在源码里。
+    """
+    root = Path(__file__).resolve().parent.parent
+    cands = sorted((root / "runs").glob("*/ckpt_*.pt"))
+    if not cands:
+        raise SystemExit("runs/ 下没有任何 ckpt_*.pt，先训一个或指定路径："
+                         "python engine/test_tablebase.py <ckpt> [syzygy 目录]")
+    return str(cands[-1])
+
+
 if __name__ == "__main__":
-    raise SystemExit(main("runs/smoke/ckpt_00000200.pt", "data/raw/syzygy345"))
+    ckpt = sys.argv[1] if len(sys.argv) > 1 else _default_ckpt()
+    tb = sys.argv[2] if len(sys.argv) > 2 else "data/raw/syzygy345"
+    raise SystemExit(main(ckpt, tb))

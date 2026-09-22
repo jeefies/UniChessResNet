@@ -22,6 +22,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.encoding import encode, orient_move, unorient_move
 from core.moves import move_to_index, move_to_promo_index, PROMO_PIECES
 from model.net import NetConfig, UniChessNet
+# MCTS 原先在 __init__ 里按 mcts_sims>0 延迟导入。提到顶层是为了让根目录 engine.py
+# 的导入隔离能一次性把 search.mcts 也纳入（函数作用域 import 会在调用时重新经由
+# sys.modules 解析，届时 'search.mcts' 可能已被同机共存的 Transformer 仓库占住）。
+# 无循环依赖：search/mcts.py 只导入 chess / numpy / core.encoding / core.moves，
+# 不导入 engine.*，core 两个模块也不导入 search.*。
+from search.mcts import MCTS, MCTSConfig
 
 
 class UniChessEngine:
@@ -74,6 +80,13 @@ class UniChessEngine:
         self.mcts_sims = mcts_sims
         self.mcts = None
 
+        # 搜索树跨手复用的状态（见 _take_root）。_root_ply / _root_epd 一起
+        # 构成「这棵树属于哪个局面」的凭证，缺一不可。
+        self._root = None
+        self._root_ply: int = -1
+        self._root_epd: str | None = None
+        self.last_source: str = "network"
+
         self.book = None
         if book_path and Path(book_path).exists():
             try:
@@ -83,7 +96,7 @@ class UniChessEngine:
                 print(f"info string 开局书加载失败: {e}", file=sys.stderr)
 
         if mcts_sims > 0:
-            from search.mcts import MCTS, MCTSConfig
+            # MCTS / MCTSConfig 已在模块顶层导入（原因见顶部 import 段的注释）
             self.mcts = MCTS(
                 self.evaluate_batch,
                 MCTSConfig(simulations=mcts_sims, batch_size=mcts_batch,
@@ -134,6 +147,18 @@ class UniChessEngine:
                 else:
                     wdl = self.tablebase.probe_wdl(board)   # 对手视角
                     dtz = abs(self.tablebase.probe_dtz(board))
+                    # 50 步规则先于残局表的结论生效。DTZ 不计半步钟，但实战里
+                    # halfmove_clock + dtz >= 100 就先判和了，这个「必胜」兑现不了。
+                    # search/mcts.py:_exact_value(:176) 一直有这层保护，这里没有——
+                    # 而残局表在 play() 里的优先级**高于 MCTS**，于是整条正确的
+                    # 搜索逻辑会被一个兑现不了的结论盖掉，和棋当赢棋走。
+                    # 降级成 0（实际结果就是和），让排序去挑真正能在 50 步内
+                    # 兑现的着法；若全都兑现不了，上面的 zeroing 会优先推兵/吃子
+                    # 来重置半步钟，这正是唯一还有希望的下法。
+                    # wdl=+2（我方必负）同样降级：对手也一样收不掉，那就是和棋，
+                    # 排序上理应好过真的输棋。
+                    if abs(wdl) == 2 and board.halfmove_clock + dtz >= 100:
+                        wdl = 0
             except Exception as e:
                 err_key = type(e).__name__ + ":" + str(e)
                 if err_key not in self._tb_missing:
@@ -218,20 +243,126 @@ class UniChessEngine:
                 torch.softmax(pr_l[0].float(), 0).cpu().numpy(),
                 torch.softmax(w_l[0].float(), 0).cpu().numpy())
 
-    def _from_mcts(self, board: chess.Board) -> chess.Move | None:
-        if self.mcts is None or self.mcts_sims <= 0:
+    # ---------- 搜索树跨手复用 ----------
+
+    _ROOT_MAX_SKIP = 4          # 跳过这么多手以上就重建：重放的收益追不上失配的风险
+
+    def _take_root(self, board: chess.Board):
+        """把上一步留下的搜索树对齐到当前局面；对不上就返回 None（从零重建）。
+
+        复用的收益全来自对手走的那一手：它的子树上一轮已经搜过，省下的是
+        一整批网络前向，典型能少算三到六成模拟。
+
+        风险是**把别的对局的树接到当前局面上**。`MCTS.search` 在
+        `root.expanded` 为真时会跳过根节点展开（search/mcts.py:313），
+        不去核对 root 是否真的对应这个 board——接错了不会报错，会静默地
+        按另一个局面下棋。UCI 下这完全可能发生：`ucinewgame` 之后对手可能
+        已经先走了几手，单看 move_stack 的长度分不出是同一局还是新的一局。
+
+        所以这里真把局面退回去比对 EPD。代价是几次 pop，比一次网络前向
+        便宜两个数量级，没有任何理由为它省。
+        """
+        root, ply, epd = self._root, self._root_ply, self._root_epd
+        self._root, self._root_ply, self._root_epd = None, -1, None
+        if root is None or ply < 0 or epd is None:
             return None
-        mv, _ = self.mcts.best_move(board, simulations=self.mcts_sims,
-                                    temperature=self.temperature)
+        back = len(board.move_stack) - ply
+        # back == 0：同一局面被重复搜索（arena 重发 go），照样可以复用
+        if back < 0 or back > self._ROOT_MAX_SKIP:
+            return None
+        probe = board.copy(stack=True)
+        for _ in range(back):
+            probe.pop()
+        if probe.epd() != epd:
+            return None                       # 不是同一条棋路
+        for mv in board.move_stack[ply:]:
+            root = MCTS.advance_root(root, mv)
+            if root is None:
+                return None                   # 这一手当时没被搜到，无树可复用
+        return root
+
+    def reset_search(self) -> None:
+        """丢弃搜索树。新开一局（UCI 的 ucinewgame）必须调，否则会跨局残留。"""
+        self._root, self._root_ply, self._root_epd = None, -1, None
+        self.last_source = "network"
+
+    def search_info(self) -> dict:
+        """上一次 MCTS 搜索的可上报信息，供 UCI 的 info 行使用。
+
+        score 取根节点访问数最大那一枝的 Q（**搜索之后**的值），而不是网络
+        直出的 WDL：前者才是引擎真正据以决策的数，而且省掉一次额外前向。
+        非 MCTS 出招（残局表/开局书/网络直出）时 self._root 是上一步的旧树，
+        报出去就是错的，所以用 last_source 挡住。
+        """
+        info = {"sims": 0, "nodes": 0, "depth": 0, "q": None, "pv": [],
+                "reused": False, "stopped_early": False}
+        if self.last_source != "mcts" or self.mcts is None:
+            return info
+        m = getattr(self.mcts, "last_metrics", {})
+        info["sims"] = int(m.get("simulations", 0))
+        info["nodes"] = int(m.get("network_positions", 0))
+        info["depth"] = int(m.get("max_depth", 0))
+        info["reused"] = bool(m.get("reused_root", False))
+        info["stopped_early"] = bool(m.get("stopped_early", False))
+
+        root = self._root
+        if root is None or not root.moves or root.sum_N <= 0:
+            return info
+        i = int(np.argmax(root.N))
+        if root.N[i] > 0:
+            info["q"] = float(root.W[i]) / float(root.N[i])
+        # 主变：每层取访问数最大的一枝，直到没有已展开的子节点
+        node, pv = root, []
+        while node is not None and node.moves and len(pv) < 24:
+            j = int(np.argmax(node.N))
+            if node.N[j] <= 0:
+                break
+            pv.append(node.moves[j])
+            node = node.children[j]
+        info["pv"] = pv
+        return info
+
+    def _from_mcts(self, board: chess.Board, sims: int | None = None,
+                   deadline: float | None = None) -> chess.Move | None:
+        n = self.mcts_sims if sims is None else sims
+        if self.mcts is None or n <= 0:
+            return None
+        reused = self._take_root(board)
+        try:
+            mv, root = self.mcts.best_move(board, simulations=n,
+                                           temperature=self.temperature,
+                                           root=reused, deadline=deadline)
+        except Exception:
+            if reused is None:
+                raise
+            # 复用的树出问题只会炸在这里。从零重搜一次，别把这一步降级成网络直出。
+            print("info string 搜索树复用失败，本步从零重建", file=sys.stderr)
+            mv, root = self.mcts.best_move(board, simulations=n,
+                                           temperature=self.temperature,
+                                           deadline=deadline)
+        self._root = root
+        self._root_ply = len(board.move_stack)
+        self._root_epd = board.epd()
         return mv
 
-    def play(self, board: chess.Board) -> chess.Move:
+    def play(self, board: chess.Board, *, sims: int | None = None,
+             deadline: float | None = None) -> chess.Move:
         """选出一步棋。保证返回合法走法。
 
         优先级：残局表 > 开局书 > MCTS（若开启）> 网络直出。
+
+        sims     本步的 MCTS 模拟次数上限，不传就沿用构造时的 mcts_sims。
+        deadline 墙钟截止（time.perf_counter() 的刻度）。**计时赛必须传它**：
+                 「模拟次数」换算成「时间」依赖一个 nps 估计，而 nps 随设备、
+                 网络规模、这一步能复用多少树而变，第一步更是完全没有实测值。
+                 只靠 sims 封顶就会在首步超时判负（实测 CPU 上差了一个数量级）。
         """
-        for source in (self._from_tablebase, self._from_book, self._from_mcts):
+        self.last_source = "network"
+        for name, source in (("tablebase", self._from_tablebase),
+                             ("book", self._from_book),
+                             ("mcts", lambda b: self._from_mcts(b, sims, deadline))):
             mv = source(board)
             if mv is not None and mv in board.legal_moves:
+                self.last_source = name
                 return mv
         return self._from_network(board)
