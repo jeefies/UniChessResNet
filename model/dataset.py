@@ -71,6 +71,55 @@ def decode_batch(recs: np.ndarray) -> np.ndarray:
     return planes
 
 
+# 易位索引的两种写法。镜像后（永远是我方在下方）王一定在 e1 = 4 号格。
+_E1 = 4
+_CASTLE_FIX = (
+    (_E1 * 64 + 7, _E1 * 64 + 6),   # e1h1（王吃己车，Chess960 写法）-> e1g1
+    (_E1 * 64 + 0, _E1 * 64 + 2),   # e1a1                          -> e1c1
+)
+
+
+def _repair_castling(policy: np.ndarray, recs: np.ndarray) -> int:
+    """把易位标签从「王吃己车」写法搬到「王走两格」写法，返回搬动的条数。
+
+    data/shards_evals 是用修复前的 build_evals.py 建的：那份代码用
+    `chess.Move.from_uci` 直接吃 Lichess 评估库的 UCI，而该库把易位写成
+    e1h1 / e1a1。`mv in board.legal_moves` 对这种形式返回 True
+    （python-chess 内部会先归一化再判定），于是它通过了校验，索引却按
+    to_square=h1 算成了 4*64+7。
+
+    **推理端读的是 4*64+6**（对 board.legal_moves 里的 e1g1 算索引）。
+    所以这些概率在实战中一次也读不到——等于网络从来没学过易位，引擎也
+    从来拿不到易位的先验。实测：12G 分片里 2587 个易位标签有 2585 个是
+    错误形式，占全部策略质量的 1.99%。
+
+    重建 12G 分片代价太高，所以在解码时修。判据是「我方王是否在 e1」：
+    索引 4*64+7 本身并不一定是易位——王在别处时，e1 上的车走到 h1 也是
+    这个索引，那是合法的普通着法，绝不能搬。而王在 e1 时，王不可能用一步
+    走到 h1，所以此时该索引只可能是易位。
+
+    修好 build_evals.py 之后新建的分片不会再命中这里（那时索引已经是
+    4*64+6），这个函数会自然变成空操作，留着是为了老分片还能用。
+    """
+    kings = recs["kings"].astype(np.uint64)
+    white = recs["occ_white"].astype(np.uint64)
+    black = recs["occ_black"].astype(np.uint64)
+    # side: 0=白。镜像后我方在下方，所以白方看 E1(4)、黑方看 E8(60)。
+    is_white = recs["side"] == 0
+    on_e1 = np.where(is_white,
+                     (kings & white & np.uint64(1 << 4)) != 0,
+                     (kings & black & np.uint64(1 << 60)) != 0)
+    rows = np.flatnonzero(on_e1)
+    moved = 0
+    for src, dst in _CASTLE_FIX:
+        r = rows[policy[rows, src] > 0]
+        if r.size:
+            policy[r, dst] += policy[r, src]
+            policy[r, src] = 0.0
+            moved += int(r.size)
+    return moved
+
+
 def decode_targets(recs: np.ndarray):
     """记录 -> (policy_target[N,4096], promo_target[N], wdl_target[N,3])。"""
     n = len(recs)
@@ -79,6 +128,7 @@ def decode_targets(recs: np.ndarray):
     pb = recs["policy_prob"].astype(np.float32) / _SCALE
     rows = np.repeat(np.arange(n), 5)
     np.add.at(policy, (rows, mv.ravel()), pb.ravel() * (pb.ravel() > 0))
+    _repair_castling(policy, recs)      # 老分片的易位索引修正，见该函数
     s = policy.sum(axis=1, keepdims=True)
     np.divide(policy, s, out=policy, where=s > 0)
 

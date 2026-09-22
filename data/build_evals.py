@@ -97,10 +97,20 @@ def process_lines(args) -> bytes:
             if score is None:
                 continue
             try:
-                mv = chess.Move.from_uci(uci)
+                # **必须用 board.parse_uci，不能用 chess.Move.from_uci。**
+                # 评估库（Lichess）把易位写成「王吃己车」的 e1h1 / e1a1
+                # （Chess960 写法）。from_uci 原样返回 Move(e1, h1)，而
+                # `mv in board.legal_moves` 对它返回 **True**——python-chess 的
+                # is_pseudo_legal 内部会先 _from_chess960 归一化再判定。于是
+                # 这个非规范形式一路通过校验，move_to_index 拿到的 to_square
+                # 却还是 h1，标签就写到了索引 4*64+7 上。
+                # 而推理端（search/mcts.py:priors_from_policy）是对
+                # board.legal_moves 里的 e1g1 算索引 4*64+6 去查表的，
+                # **那份易位概率永远读不到**。实测已建好的 shards_evals 里
+                # 2587 个易位标签有 2585 个是错的形式，占全部策略质量的 1.99%。
+                # parse_uci 会先归一化再校验合法性，非法则抛异常。
+                mv = board.parse_uci(uci)
             except Exception:
-                continue
-            if mv not in board.legal_moves:
                 continue
             om = orient_move(mv, board.turn)
             idx = move_to_index(om)
