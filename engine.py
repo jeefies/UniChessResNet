@@ -177,6 +177,8 @@ class GameEngine:
     # 服务端据此如实上报 /api/models 状态（Server/models/__init__.py:181,207,237）
     IMPLEMENTED: bool = True
     NOT_IMPLEMENTED_REASON: str = ""
+    # 批量对弈 / 观战走 UniChessKit 原生 Player（跨局攒批），以 preset=<config.json 预设名> 调用
+    KIT_FACTORY: str = "unichess_r.kit_adapter:make_player_factory"
 
     def __init__(
         self,
