@@ -32,8 +32,8 @@ import numpy as np
 import zstandard as zstd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.encoding import orient_move
-from core.moves import move_to_index, move_to_promo_index
+from unichess_r.core.encoding import orient_move
+from unichess_r.core.moves import move_to_index, move_to_promo_index
 from data.annotate import score_to_wdl
 from data.record import RECORD_DTYPE, board_to_record
 

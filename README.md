@@ -123,10 +123,9 @@ GPU 机 30 GB 内存 > 12.29 GB 分片，全量落地后不会有 I/O 瓶颈。
 ./data/download_mt.sh <url> <out> 8             # 多连接下载（每块 10 分钟超时重启）
 .venv/bin/python data/build_evals.py --out data/shards_evals
 ./data/ship_shards.sh                           # 压缩后送到 GPU 机
-./scripts_stopall.sh                            # 停掉所有后台传输
 
 # GPU 机上
-python model/train.py --data data/shards_evals --preset medium --device cuda --batch 1024
+python unichess_r/model/train.py --data data/shards_evals --preset medium --device cuda --batch 1024
 
 # 引擎（UNICHESS_MCTS>0 启用搜索）
 UNICHESS_CKPT=runs/xxx/ckpt.pt UNICHESS_MCTS=800 ./unichess.sh

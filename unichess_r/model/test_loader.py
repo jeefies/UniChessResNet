@@ -13,8 +13,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from model.dataset import (BatchShardDataset, ShardDataset, make_loader)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from unichess_r.model.dataset import (BatchShardDataset, ShardDataset, make_loader)
 
 
 def check_equivalence(shard_dir: str, n: int = 3000) -> bool:

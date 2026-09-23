@@ -16,9 +16,9 @@ import chess
 import numpy as np
 
 sys.path.insert(0, ".")
-from core.encoding import (INPUT_SHAPE, encode, orient, orient_move,
+from unichess_r.core.encoding import (INPUT_SHAPE, encode, orient, orient_move,
                            unorient_move)
-from core.moves import (index_to_move, move_to_index, move_to_promo_index)
+from unichess_r.core.moves import (index_to_move, move_to_index, move_to_promo_index)
 
 # 升变/易位/吃过路兵密集的局面，弥补随机对局覆盖不到的角落
 EDGE_FENS = [

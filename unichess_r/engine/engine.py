@@ -18,16 +18,16 @@ import chess
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.encoding import encode, orient_move, unorient_move
-from core.moves import move_to_index, move_to_promo_index, PROMO_PIECES
-from model.net import NetConfig, UniChessNet
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from unichess_r.core.encoding import encode, orient_move, unorient_move
+from unichess_r.core.moves import move_to_index, move_to_promo_index, PROMO_PIECES
+from unichess_r.model.net import NetConfig, UniChessNet
 # MCTS 原先在 __init__ 里按 mcts_sims>0 延迟导入。提到顶层是为了让根目录 engine.py
 # 的导入隔离能一次性把 search.mcts 也纳入（函数作用域 import 会在调用时重新经由
 # sys.modules 解析，届时 'search.mcts' 可能已被同机共存的 Transformer 仓库占住）。
 # 无循环依赖：search/mcts.py 只导入 chess / numpy / core.encoding / core.moves，
 # 不导入 engine.*，core 两个模块也不导入 search.*。
-from search.mcts import MCTS, MCTSConfig
+from unichess_r.search.mcts import MCTS, MCTSConfig
 
 
 class UniChessEngine:

@@ -12,8 +12,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.encoding import NUM_PLANES
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from unichess_r.core.encoding import NUM_PLANES
 from data.record import RECORD_DTYPE, NO_PROMO
 
 POLICY_SIZE = 4096

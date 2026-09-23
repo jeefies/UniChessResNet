@@ -32,7 +32,7 @@ from pathlib import Path
 import chess
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from engine.engine import UniChessEngine
+from unichess_r.engine.engine import UniChessEngine
 
 NAME = "UniChess"
 AUTHOR = "jeefy"

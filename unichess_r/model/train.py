@@ -23,9 +23,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from model.dataset import make_loader
-from model.net import (PRESETS, NetConfig, UniChessNet, count_params,
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from unichess_r.model.dataset import make_loader
+from unichess_r.model.net import (PRESETS, NetConfig, UniChessNet, count_params,
                        legal_from_to_mask)
 
 # 掩码位置填的哨兵值。**绝不能用 -inf**：被掩掉的位置上 target 恰好是 0，

@@ -1,7 +1,7 @@
 """纯计算基准：合成数据，不经过 dataloader，测 GPU 天花板。"""
 import sys, time, torch, torch.nn.functional as F
 sys.path.insert(0, '.')
-from model.net import UniChessNet, PRESETS
+from unichess_r.model.net import UniChessNet, PRESETS
 
 dev = torch.device('cuda')
 for preset in ('medium', 'small'):

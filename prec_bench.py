@@ -1,8 +1,8 @@
 """对比推理精度：fp32 vs bf16 vs fp16。"""
 import sys, time, torch, numpy as np, chess
 sys.path.insert(0, '.')
-from engine.engine import UniChessEngine
-from core.encoding import encode
+from unichess_r.engine.engine import UniChessEngine
+from unichess_r.core.encoding import encode
 
 eng = UniChessEngine(sys.argv[1], device='cuda', syzygy_path='data/raw/syzygy345')
 boards=[]

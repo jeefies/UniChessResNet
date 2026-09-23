@@ -17,8 +17,8 @@ import chess
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.encoding import unorient_move
-from core.moves import index_to_move
+from unichess_r.core.encoding import unorient_move
+from unichess_r.core.moves import index_to_move
 from data.record import (RECORD_DTYPE, NO_PROMO, record_policy,
                          record_to_board, record_wdl)
 

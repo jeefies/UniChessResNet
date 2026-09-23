@@ -33,8 +33,8 @@ import numpy as np
 # 调用时拿到的就是对方那套 64 token 编码，无声算错而不是报错。
 # 没有循环依赖：core.encoding 只依赖 chess + numpy，core.moves 只依赖 chess，
 # 两者都不 import search.*。
-from core.encoding import orient_move
-from core.moves import move_to_index, move_to_promo_index
+from unichess_r.core.encoding import orient_move
+from unichess_r.core.moves import move_to_index, move_to_promo_index
 
 # 带墙钟限制时第一批的模拟数。这一批纯粹是为了测速率，所以要小；
 # 但太小会让每步都多付一次 _collect 的固定开销，8 是个折中。
@@ -52,7 +52,7 @@ class MCTSConfig:
     dirichlet_eps: float = 0.25
     fpu_reduction: float = 0.2     # 未访问子节点的先验价值折扣
     temperature: float = 0.0       # 0 = 取访问数最大者
-    temp_moves: int = 0            # 已废弃：温度衰减由调用方（autoloop/worker.py）自己控制
+    temp_moves: int = 0            # 已废弃：温度衰减由调用方自己控制
     virtual_loss: float = 1.0
     tablebase_pieces: int = 5
     claim_draw: bool = False

@@ -15,7 +15,7 @@ import chess
 import numpy as np
 
 sys.path.insert(0, ".")
-from core.encoding import encode
+from unichess_r.core.encoding import encode
 from data.record import (board_to_record, record_policy, record_to_board,
                          record_wdl)
 

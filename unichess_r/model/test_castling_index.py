@@ -23,11 +23,11 @@ from pathlib import Path
 import chess
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.encoding import orient_move
-from core.moves import move_to_index
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from unichess_r.core.encoding import orient_move
+from unichess_r.core.moves import move_to_index
 from data.record import board_to_record
-from model.dataset import decode_targets
+from unichess_r.model.dataset import decode_targets
 
 
 def _label_index(board: chess.Board, move: chess.Move) -> int:

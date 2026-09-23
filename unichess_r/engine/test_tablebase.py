@@ -16,8 +16,8 @@ from pathlib import Path
 import chess
 import chess.syzygy
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from engine.engine import UniChessEngine
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from unichess_r.engine.engine import UniChessEngine
 
 CASES = [
     # 注意：必须是合法局面。若「未行棋方正被将军」，python-chess 会生成
@@ -91,11 +91,11 @@ def _default_ckpt() -> str:
     这里改成到 runs/ 下找最新的 ckpt：残局收官靠的是 Syzygy 而不是网络，
     用哪个权重都测得出来，唯独「哪个权重存在」不该写死在源码里。
     """
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parents[2]
     cands = sorted((root / "runs").glob("*/ckpt_*.pt"))
     if not cands:
         raise SystemExit("runs/ 下没有任何 ckpt_*.pt，先训一个或指定路径："
-                         "python engine/test_tablebase.py <ckpt> [syzygy 目录]")
+                         "python unichess_r/engine/test_tablebase.py <ckpt> [syzygy 目录]")
     return str(cands[-1])
 
 

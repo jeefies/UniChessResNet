@@ -13,10 +13,10 @@ from pathlib import Path
 import chess
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.encoding import encode
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from unichess_r.core.encoding import encode
 from data.record import RECORD_DTYPE, board_to_record
-from model.dataset import decode_batch, decode_targets, piece_count_bucket
+from unichess_r.model.dataset import decode_batch, decode_targets, piece_count_bucket
 
 EDGE_FENS = [
     "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",

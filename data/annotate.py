@@ -26,8 +26,8 @@ import chess.engine
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.encoding import orient_move
-from core.moves import move_to_index, move_to_promo_index
+from unichess_r.core.encoding import orient_move
+from unichess_r.core.moves import move_to_index, move_to_promo_index
 from data.record import RECORD_DTYPE, board_to_record
 
 # Lichess 的 centipawn -> 胜率换算（logistic），用于把 SF 评分变成 WDL

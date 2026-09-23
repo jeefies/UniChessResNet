@@ -15,9 +15,9 @@ from pathlib import Path
 import chess
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from engine.engine import UniChessEngine
-from search.mcts import MCTS, MCTSConfig
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from unichess_r.engine.engine import UniChessEngine
+from unichess_r.search.mcts import MCTS, MCTSConfig
 
 POSITIONS = [
     ("起始局面", chess.STARTING_FEN),

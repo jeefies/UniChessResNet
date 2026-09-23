@@ -12,8 +12,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from engine.engine import UniChessEngine
-from search.mcts import MCTS, MCTSConfig
+from unichess_r.engine.engine import UniChessEngine
+from unichess_r.search.mcts import MCTS, MCTSConfig
 
 ckpt = sys.argv[1]
 threads = int(sys.argv[2]) if len(sys.argv) > 2 else 16

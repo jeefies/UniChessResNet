@@ -11,7 +11,7 @@
 * 服务端用 `spec_from_file_location('unichess_server_models.<name>.engine', ...)`
   + `exec_module` 加载本文件。模块名是合成的，没有真实父包，且模型目录
   **不会**被加入 `sys.path`。所以相对导入不可能，必须自己把仓库根目录
-  挂到 `sys.path` 上，之后才能 `from engine.engine import ...`。
+  挂到 `sys.path` 上，之后才能 `from unichess_r.engine.engine import ...`。
 * 服务端的工作目录是 `Server/`（`Server/README.md:54-58`），不是本仓库根目录。
   因此 config.json 里写的相对路径（如 `runs/stage1/ckpt_00187578.pt`）一律
   相对 `RESNET_ROOT` 解析，见 `_resolve_path`。这也是这个目录可以整体搬走
@@ -21,15 +21,12 @@
   `_ensure_backend()`。否则服务启动就要吃掉 torch 的导入耗时，而缺 checkpoint
   之类的问题会让整个模型被报成 `error`。
 
-命名冲突说明（看着吓人，其实没问题）：本文件是仓库根目录下的 `engine.py`，
-而仓库里同时存在 `engine/` 包。CPython 的 FileFinder 在同一个 sys.path 条目内
-**先解析包、后解析同名模块**，所以 `from engine.engine import UniChessEngine`
-仍然命中 `engine/engine.py`。兄弟项目 Transformer 是同样的布局，已验证可用。
+引擎代码都在 `unichess_r/` 包里（Transformer 是 `unichess_t/`），两个模型同进程
+挂载时不会再抢 core / engine / model / search 这些顶层名字。
 """
 from __future__ import annotations
 
 import logging
-import os
 import sys
 import threading
 import time
@@ -61,187 +58,6 @@ _SHARED_ENGINES: dict[tuple, Any] = {}
 _SHARED_LOCK = threading.Lock()
 
 
-# =====================================================================
-# 导入隔离：与同机共存的 Transformer 仓库抢同一批顶层包名
-# =====================================================================
-#
-# **为什么需要这段东西。** 部署机上的服务端同时挂了第二个模型 `models/T`，
-# 它是指向兄弟仓库 `UniChess/Transformer` 的符号链接。两个仓库定义了**完全
-# 相同的一批顶层包名**：core / engine / model / search / eval（外加模块 uci、
-# 目录 tools）。而 Transformer 的适配层在**模块顶层**就把它们全拉进来了：
-# `Transformer/engine.py:25-29` 先 `sys.path.insert(0, TRANSFORMER_ROOT)`，
-# 紧接着 `from engine.engine import TransformerEngine`；
-# `Transformer/engine/engine.py:15-18` 又 import 了裸的 core.encoding /
-# core.moves / model.transformer / search.mcts。
-#
-# 这不是"只要没人用 Transformer 就不会发生"：`Server/app.py:64-70` 的
-# `list_models()` 会对**每个**发现到的模型调 `describe_model`，后者经
-# `Server/models/__init__.py:196` 的 `_load_engine_class` → `exec_module`
-# 真正执行适配层模块体。也就是说一次 `GET /api/models` 就会按 sorted() 顺序
-# 把两个适配层都执行一遍，而 'T' 排在我们前面时，上面那批 sys.modules 键
-# 已经是 Transformer 的模块对象了。
-#
-# **为什么调 sys.path 顺序解决不了。** import 机制先查 sys.modules，按
-# **全限定名**命中就直接返回缓存对象，根本不会再去看 sys.path。所以本文件
-# 顶部那句 `sys.path.insert(0, RESNET_ROOT)` 对已经缓存的 'core' /
-# 'engine.engine' 毫无作用。后果分三档：
-#   * `from engine.engine import UniChessEngine` → Transformer 的
-#     engine.engine 没有这个名字 → ImportError；
-#   * 就算过了，`from model.net import ...` → Transformer 的 model/ 下
-#     没有 net.py → ModuleNotFoundError；
-#   * 最坏的一档是**不报错**：两边的 core.encoding 都有同名同签名的
-#     encode / orient_move，但张量布局不同（本仓库是 19 平面 (19,8,8)，
-#     core/encoding.py:25-27），串线之后是安静地算错棋，不是崩。
-# 而 `describe_model` 把加载整个包在 `except Exception` 里
-# （`Server/models/__init__.py:199-200`）降级成 `{'status': 'error'}`，
-# 所以线上表现要么是我们这个模型显示 error，要么是用错权重下棋。两者都不能接受。
-#
-# **为什么必须有 _ISOLATED_MODULES 这个硬引用字典。** 慢路径会把我们导入出来的
-# 模块对象从 sys.modules 里摘掉（好把对方的缓存原样放回去）。一旦摘掉，
-# 就没有任何东西持有它们了；模块对象被 GC 时 CPython 会清空其 __dict__，
-# 于是 ResNet 里每个函数的全局名字都变成 NameError。所以必须永久持有强引用。
-#
-# **为什么 Part 1 的 import 提升是本方案的前提。** 函数作用域的 import 在
-# **每次调用**时才经由 sys.modules 按名字解析，那个时刻早已不在本 dance 内部，
-# sys.modules 里躺着的是对方的模块。所以 search/mcts.py 里 priors_from_policy
-# 对 core.encoding / core.moves 的导入、engine/engine.py 里对 search.mcts
-# 的导入都已提到各自模块顶层；慢路径在 dance 内部一次性把 core.encoding、
-# core.moves、model.net、search.mcts、engine.engine 全部导入完，事后不留任何
-# 需要再解析的名字。
-#
-# **反方向（我们污染对方）。** 慢路径在 finally 里撤掉自己加的 sys.path 条目，
-# 但撤不掉 `engine/engine.py:21` 那句无保护的 `sys.path.insert`（本仓库其他
-# 入口依赖它，不能动）。这**不会**影响对方：走到慢路径时对方的
-# core / engine / model / search 早已在 sys.modules 里缓存好，后续 import
-# 命中缓存、不看 sys.path；而我们导入出来的同名模块在 dance 结束时已经从
-# sys.modules 移除，对方也不会拿到我们的。剩下的唯一影响面是"两边都还没导入过
-# 的**第三个**同名顶层包"这种不存在的情况。
-# =====================================================================
-
-# 两个仓库都会定义的顶层名字。判定归属时，sys.modules 的 key 等于该名字、
-# 或以 `name + '.'` 开头，都算属于它。
-_COLLIDING_TOP_LEVEL = (
-    "core", "engine", "model", "search", "eval", "uci", "tools",
-    "autoloop", "selfplay",
-)
-
-# 慢路径导入出来的 ResNet 模块对象；**永久强引用**，不能清空（见上面注释）。
-_ISOLATED_MODULES: dict[str, Any] = {}
-
-
-def _is_within(child: Path, parent: Path) -> bool:
-    """child 是否在 parent 之内。Path.is_relative_to 需要 3.9+。
-
-    部署机上服务端跑的是 conda python、本仓库自带 venv 是 3.14，都够；
-    但这里留一个 os.path.commonpath 的兜底，免得某台 3.8 的机器
-    连模块都导入不进来。
-    """
-    try:
-        return child.is_relative_to(parent)
-    except AttributeError:
-        try:
-            return os.path.commonpath([str(child), str(parent)]) == str(parent)
-        except (ValueError, OSError):
-            return False
-    except (ValueError, OSError):
-        return False
-
-
-def _module_is_ours(mod: Any) -> bool:
-    """模块是否来自本仓库。判不出来的一律当外来（宁可多做一次隔离）。"""
-    path = getattr(mod, "__file__", None)
-    if path:
-        try:
-            return _is_within(Path(path).resolve(), RESNET_ROOT)
-        except (OSError, ValueError, TypeError):
-            return False
-    # __file__ 为 None：命名空间包（如 tools/）只有 __path__
-    entries = getattr(mod, "__path__", None)
-    if entries:
-        try:
-            resolved = [Path(p).resolve() for p in list(entries)]
-        except (OSError, ValueError, TypeError):
-            return False
-        # 空 __path__ 判不出来；有条目则要求全部落在本仓库内
-        return bool(resolved) and all(_is_within(p, RESNET_ROOT) for p in resolved)
-    return False
-
-
-def _colliding_keys() -> list[str]:
-    """当前 sys.modules 里所有属于冲突顶层名的 key。"""
-    out = []
-    for key in list(sys.modules):
-        head = key.split(".", 1)[0]
-        if head in _COLLIDING_TOP_LEVEL:
-            out.append(key)
-    return out
-
-
-def _foreign_collisions() -> list[str]:
-    """已被**别的项目**占住的冲突 key。空列表 = 可以走快路径。"""
-    foreign = []
-    for key in _colliding_keys():
-        mod = sys.modules.get(key)
-        if mod is None:          # 占位的 None（失败过的导入）算外来
-            foreign.append(key)
-            continue
-        if not _module_is_ours(mod):
-            foreign.append(key)
-    return foreign
-
-
-def _import_isolated() -> dict[str, Any]:
-    """慢路径：存 / 摘 / 导 / 取 / 还。
-
-    返回本仓库那几个模块对象（键是模块全名）。函数返回后 sys.modules
-    与进入时**逐键一致**，包括原本不存在的键仍然不存在。
-    """
-    saved: dict[str, Any] = {key: sys.modules[key] for key in _colliding_keys()}
-    root = str(RESNET_ROOT)
-    # 进入时 root 在 sys.path 里出现了几次；退出时恢复成同样的次数。
-    path_count_before = sys.path.count(root)
-    try:
-        for key in saved:
-            del sys.modules[key]
-
-        # 必须插到**最前面**，不能只判断"在不在里面"：如果对方的适配层比我们
-        # 后加载，TRANSFORMER_ROOT 就在 sys.path[0]，而我们的 root 在后面，
-        # 这时 `core` 仍会从对方仓库解析出来。
-        if not sys.path or sys.path[0] != root:
-            sys.path.insert(0, root)
-
-        import importlib
-
-        # 依赖序：core.* → model.net → search.mcts → engine.engine。
-        # 推理路径上会用到的全部一次导完，事后不留待解析的名字。
-        wanted = ("core.encoding", "core.moves", "model.net",
-                  "search.mcts", "engine.engine")
-        ours: dict[str, Any] = {}
-        for name in wanted:
-            ours[name] = importlib.import_module(name)
-
-        # 连带产生的父包等等也要一起持有强引用，否则它们被 GC 后
-        # 子模块里的 `import core.xxx` 语义会崩。
-        created = _colliding_keys()
-        for key in created:
-            _ISOLATED_MODULES.setdefault(key, sys.modules[key])
-        _ISOLATED_MODULES.update(ours)
-
-        for key in created:
-            del sys.modules[key]
-        return ours
-    finally:
-        # 无论中途哪一步炸了，都把对方的缓存原样还回去，绝不留混合状态
-        for key in _colliding_keys():
-            del sys.modules[key]
-        sys.modules.update(saved)
-        # 撤掉自己加的 sys.path 条目，不让本仓库根目录长期压在对方前面。
-        # 注意 engine/engine.py:21 那句无保护 insert 也会加一次，所以这里按
-        # "多出来几个就删几个"处理，而不是无条件 remove 一次。
-        while sys.path.count(root) > path_count_before:
-            sys.path.remove(root)
-
-
 def _resolve_path(value: str | Path | None) -> str | None:
     """相对路径按 RESNET_ROOT 解析，绝对路径原样返回；空值返回 None。
 
@@ -264,10 +80,9 @@ def _resolve_path(value: str | Path | None) -> str | None:
 def _ensure_backend() -> None:
     """真正需要推理时才导入 torch / numpy / 仓库内部模块。
 
-    只导入 `engine.engine` 和 `search.mcts`：这两条链路只依赖
-    torch + python-chess + numpy。绝不导入 `model.dataset`、`model.train*`
-    或 `autoloop/*`——前者需要本 checkout 里缺失的 `data/record.py`，
-    后者在 `autoloop/common.py:2` 顶层 import fcntl（Windows 上直接失败）。
+    只导入 `unichess_r.engine.engine` 和 `unichess_r.search.mcts`：这两条链路只依赖
+    torch + python-chess + numpy。绝不导入 `unichess_r.model.dataset` / `train*`
+    ——它们需要本 checkout 里缺失的 `data/record.py`。
     """
     global _torch, _np, _UniChessEngine, _MCTS, _MCTSConfig
     if _UniChessEngine is not None:
@@ -275,29 +90,13 @@ def _ensure_backend() -> None:
     import numpy as np
     import torch
 
-    # 加锁：服务端可能有多个会话并发首次构造，慢路径对 sys.modules 的
-    # 存/摘/还过程绝不能交错执行。
+    # 包名是 unichess_r（与 Transformer 的 unichess_t 不再同名），直接导入即可；
+    # 历史上这里有一段 150 行的 sys.modules 隔离导入，改包名后已删除。
     with _SHARED_LOCK:
         if _UniChessEngine is not None:
             return
-        foreign = _foreign_collisions()
-        if foreign:
-            # 慢路径：同机的 Transformer 已经占住了同名包（见上面那段说明）
-            logger.warning(
-                "检测到 %d 个同名顶层模块被其他项目占用（示例：%s），"
-                "改用隔离导入加载 ResNet 后端",
-                len(foreign), ", ".join(sorted(foreign)[:5]),
-            )
-            ours = _import_isolated()
-            UniChessEngine = ours["engine.engine"].UniChessEngine
-            MCTS = ours["search.mcts"].MCTS
-            MCTSConfig = ours["search.mcts"].MCTSConfig
-        else:
-            # 快路径：没有冲突，就按原来的方式直接导入，行为与改动前完全一致
-            if str(RESNET_ROOT) not in sys.path:
-                sys.path.insert(0, str(RESNET_ROOT))
-            from engine.engine import UniChessEngine
-            from search.mcts import MCTS, MCTSConfig
+        from unichess_r.engine.engine import UniChessEngine
+        from unichess_r.search.mcts import MCTS, MCTSConfig
 
         _torch = torch
         _np = np
@@ -353,8 +152,7 @@ def get_shared_engine(
                 half=bool(half),
             )
             if device == "cuda":
-                # channels-last 不在 UniChessEngine 内部做，由调用方补
-                # （autoloop/alphazero.py:439-443 是仓库里的标准加载片段）。
+                # channels-last 不在 UniChessEngine 内部做，由调用方补。
                 # 出错绝不能影响启动，所以整段包在 try 里。
                 try:
                     engine.model.to(memory_format=_torch.channels_last)
@@ -447,8 +245,7 @@ class GameEngine:
                     root_min_visits=int(root_min_visits),
                     # 人机对弈要把三次重复/50 步当和棋算进搜索，
                     # 否则引擎会在已经和了的局面里继续"找赢"。
-                    # UniChessEngine 自己没开，但 autoloop 的每个调用方都开
-                    # （worker.py:159、layered.py:398、alphazero.py:278）。
+                    # UniChessEngine 自己没开，由调用方决定。
                     claim_draw=bool(claim_draw),
                 ),
                 tablebase=self.engine.tablebase,
@@ -575,8 +372,7 @@ class GameEngine:
 
         **故意不关 self.engine.tablebase / self.engine.book，也不丢 model**：
         它们属于跨会话共享的 UniChessEngine，别的活跃会话还在用。
-        仓库里常规的单所有者拆解流程（autoloop/alphazero.py:446-459）确实会
-        close 残局表，但那里的 engine 只有一个所有者；这里不是。
+        单所有者的场景可以 close 残局表，但这里的 engine 被多个会话共享。
 
         本方法可能在**构造未完成**的实例上被调用：create_engine 在 setup
         抛异常后会兜底调 cleanup（session_manager.py:216-225），此时
