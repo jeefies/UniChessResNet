@@ -1,6 +1,6 @@
 # AGENTS.md — UniChess ResNet
 
-Chess engine: Stockfish-distilled ResNet + MCTS (maintenance mode). Library code lives in the `unichess_r` package (`core/ engine/ model/ search/`); batch arenas and self-play go through UniChessKit via `unichess_r/kit_adapter.py`. The old autonomous loop (`autoloop/`, `selfplay/`, `tools/`) and its systemd units were removed on 2026-09-23. `README.md` (Chinese) holds measured Elo/throughput numbers and a bug-history log worth reading before changing encoding, MCTS, or data labeling.
+Chess engine: Stockfish-distilled ResNet + MCTS (maintenance mode). Library code lives in the `unichess_r` package (`core/ engine/ model/ search/`); batch arenas and self-play go through UniChessKit via `unichess_r/kit_adapter.py` (`evaluate_batch` for boards, `evaluate_planes` for pre-encoded planes, which the kit C++ PUCT uses by default). The old autonomous loop (`autoloop/`, `selfplay/`, `tools/`) and its systemd units were removed on 2026-09-23. `README.md` (Chinese) holds measured Elo/throughput numbers and a bug-history log worth reading before changing encoding, MCTS, or data labeling.
 
 ## This checkout is source-only — most of the repo cannot run here
 

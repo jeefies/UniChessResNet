@@ -206,13 +206,21 @@ class UniChessEngine:
         单条推理和 256 条推理在 GPU 上耗时相近，所以 MCTS 必须批量收集叶子
         再调这里，而不是每个叶子调一次 evaluate()。
         """
-        xs = np.stack([encode(b) for b in boards])
+        return self.evaluate_planes(np.stack([encode(b) for b in boards]))
+
+    @torch.no_grad()
+    def evaluate_planes(self, xs: np.ndarray):
+        """同 evaluate_batch，但输入是已编码的 (N, 19, 8, 8) float32（kit 的 C++ PUCT 直接写出编码）。
+
+        分桶用的子力数 = 平面 0-11 的 1 的个数，与 popcount(board.occupied) 相同。
+        """
+        xs = np.ascontiguousarray(xs, dtype=np.float32)
         x = torch.from_numpy(xs).to(self.device)
         bucket = None
         if getattr(self.cfg, "num_buckets", 1) > 1:
             nb = self.cfg.num_buckets
-            idx = [min(max((chess.popcount(b.occupied) - 1) * nb // 32, 0), nb - 1)
-                   for b in boards]
+            pieces = np.rint(xs[:, :12].sum(axis=(1, 2, 3))).astype(np.int64)
+            idx = [min(max((int(n) - 1) * nb // 32, 0), nb - 1) for n in pieces]
             bucket = torch.tensor(idx, device=self.device)
         args = (x, bucket) if bucket is not None or not hasattr(self.cfg, "d_model") else (x,)
         if self.half:
