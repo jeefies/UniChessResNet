@@ -1,0 +1,53 @@
+{
+  "task": {
+    "factory": "ResNet.kit:make_task",
+    "kwargs": {
+      "cfg": {"blocks": 24, "filters": 320},
+      "channels_last": true,
+      "data": {
+        "kind": "pool",
+        "shards": {"dir": "/home/jeefy/UniChess/ResNet/data/shards_evals",
+                   "pattern": "evals_*.bin",
+                   "slice": [null, -4]},
+        "batch_size": 128,
+        "seed": 20260909,
+        "index_seed": 20260909,
+        "cap": 50000,
+        "cache": "train_pools.npz",
+        "mode": "mixed",
+        "repair_castling": true
+      },
+      "loss": {"kind": "r_iter", "legal_mask": false},
+      "validation": {
+        "kind": "pool",
+        "shards": {"dir": "/home/jeefy/UniChess/ResNet/data/shards_evals",
+                   "pattern": "evals_*.bin",
+                   "slice": [-4, null]},
+        "modes": ["general", "endgame", "promotion"],
+        "batches": 8,
+        "batch_size": 128,
+        "seed": 991,
+        "cache": "valid_pools.npz",
+        "repair_castling": true
+      }
+    }
+  },
+  "out": "/home/jeefy/UniChess/ResNet/runs/iteration46",
+  "steps": 125000,
+  "accum": 8,
+  "seed": 20260909,
+  "device": "cuda",
+  "precision": "bf16",
+  "grad_scaler": false,
+  "clip": 2.0,
+  "nonfinite": "raise",
+  "optimizer": {"lr": 0.0003, "weight_decay": 0.0001, "betas": [0.9, 0.999], "fused": true},
+  "schedule": {"kind": "warmup_cosine_floor", "warmup": 2000, "floor": 0.05, "scale": 0.95},
+  "torch": {"num_threads": 4, "cudnn_benchmark": true},
+  "runtime": {"num_workers": 4, "pin_memory": true},
+  "log_every": 10,
+  "save_every": 1000,
+  "validate_every": 1000,
+  "validate_at": [10],
+  "export": {"best": "best.pt", "final": "final.pt", "every": 10000}
+}

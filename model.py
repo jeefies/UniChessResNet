@@ -11,7 +11,10 @@
      bilinear  <Q[from], K[to]> / sqrt(d) + bias（两端都读，见 BilinearPolicyHead）
 
 ⚠️ 改 NetConfig 的字段就会改 `cfg.__dict__`，而 checkpoint 存的就是它。
-   续训的脚本不可以直接比字典相等，必须走 cfg_conflicts()——理由见该函数。
+    续训的脚本不可以直接比字典相等，必须走 cfg_conflicts()——理由见该函数。
+
+平面尺寸 / 策略掩码定义在 Kit/planes19（losses.legal_from_to_mask 的掩码是全仓库唯一版本；
+    它要在平面上推出合法着法掩码，零误杀的验证记录见该处 docstring）。
 
 规模是配置项。Stage 1 蒸馏用 15x192，Stage 4 自对弈蒸馏到 10x128（吞吐优先）。
 """
@@ -23,38 +26,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-NUM_PLANES = 19
-POLICY_SIZE = 4096
-PROMO_SIZE = 4
+# 平面尺寸与合法着法掩码只有一个定义处：Kit/planes19。它们由 kit 的对局、搜索和训练
+# 共享，本仓库再抄一份就是三条会在某天不一致的真相。
+from Kit.planes19 import NUM_PLANES, POLICY_SIZE, PROMO_SIZE
+from Kit.planes19.losses import legal_from_to_mask
+
+# WDL 是三分类价值头的尺寸，T/R 共用的约定（kit 没有自己的价值头，不放 Kit/planes19）
 WDL_SIZE = 3
-
-
-def legal_from_to_mask(x: torch.Tensor) -> torch.Tensor:
-    """从输入平面直接推出策略掩码：[N, 19, 8, 8] -> bool [N, 4096]，索引 from*64+to。
-
-    **这不是精确的合法着法集合，而是它的一个超集**——这正是要点：漏掉一个
-    合法着法会直接把梯度算错，而多留几个非法着法只是少省一点。所以这里只用
-    两条绝对成立、且能从平面 0-5（我方兵马象车后王，见 core/encoding.py 的
-    平面布局）零成本读出的规则：
-
-        1. 起点格必须有我方棋子
-        2. 落点格不能有我方棋子（吃不了自己的子）
-
-    第 2 条要点名易位：python-chess 标准模式下易位是 e1g1 / e1c1，王走两格，
-    落点是空格，不是「王吃己车」的 e1h1（那是 Chess960 的表示）。已在 400 局
-    随机对局、23,317 个局面、716,540 个合法着法上逐一验证过：两条规则
-    **零误杀**。本仓库只下标准棋，换 Chess960 时第 2 条必须重新验。
-
-    实测平均把 4096 维压到 686 维（仅第 1 条是 882 维）。
-
-    为什么这个函数放在 model/ 而不是 core/：它要返回 torch 张量，而 core/ 只
-    依赖 chess + numpy，MCTS 走的是那条路，不能被 torch 污染。core.moves 里
-    已有一个精确版 legal_mask()，但那个要逐着法遍历 python-chess，放进训练
-    热路径就是把 GPU 饿死，而分片里也没存 FEN 可供重建。
-    """
-    ours = x[:, 0:6].amax(dim=1).flatten(1) > 0.5      # [N, 64]，索引 = 格子号
-    return (ours.unsqueeze(2) & (~ours).unsqueeze(1)).flatten(1)
-
 
 @dataclass(frozen=True)
 class NetConfig:
