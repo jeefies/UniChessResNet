@@ -98,6 +98,11 @@ def make_player_factory(checkpoint=None, *, preset: Optional[str] = None, name: 
     """``preset`` 取 config.json 的值作默认，显式参数优先；其余透传给
     ``make_search_player_factory``（simulations / batch_size / syzygy_path / book_path /
     book_plies / temperature / search_impl / PUCTConfig 字段）。"""
+    # Server 的模型插件把 config.json 的预设 dict **原样**当 kwargs 传进来（不经 preset=，
+    # 见 Server/models/__init__.py::resolve_kwargs）。这里与 preset= 路径共用同一套键映射，
+    # 否则 ckpt / mcts_sims 会漏到 PUCTConfig 上（typcls: unexpected keyword）。
+    search_kwargs = {_PRESET_KEYS.get(k, k): v for k, v in search_kwargs.items()
+                     if k not in _PRESET_IGNORED}
     explicit = dict(checkpoint=checkpoint, device=device, half=half)
     opts = {**(load_preset(preset) if preset else {}),
             **{k: v for k, v in explicit.items() if v is not None},
