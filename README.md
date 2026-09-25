@@ -66,7 +66,7 @@
 在 PRO 6000 上 13.96 steps/s × 2048 = **28,590 样本/秒 = 93%**。
 1.28 亿条 × 3 轮：5070 Ti 需 10.9 小时，**PRO 6000 约 3.6 小时**。
 
-## 验收（`./run_tests.sh`）
+## 验收（历史记录：重构前的 `./run_tests.sh`）
 
 ```
 A2 编解码往返   100,000 局面 / 2,409,338 次走法往返   零失配、零索引碰撞
@@ -77,6 +77,11 @@ A6 残局表收官    7 用例        KQvK 13 / KRvK 23 / KBNvK 31 / KPvK 19
    evals 分片    50,000 条     走法合法性/归一化/升变 全绿
 MCTS（单独跑）   一步杀 2/2、两步杀 3/3、不送杀、残局表接入、批量 128
 ```
+
+> 以上是重构前的旧套件输出，作为历史记录保留。现在的验收是
+> `python -m unittest ResNet.tests.test_r2`（12 项：结构 / 检查点往返 / preset 映射 /
+> Server 插件契约 / 两个配置的参数量钉死），加上 R0 黄金口径的推理与训练轨迹对拍
+> （见 `AGENTS.md` 的「验收」一节）。
 
 ## 开发中踩到并修掉的坑
 
@@ -118,22 +123,29 @@ GPU 机 30 GB 内存 > 12.29 GB 分片，全量落地后不会有 I/O 瓶颈。
 
 ## 用法
 
+仓库根即包（import 根是 `~/UniChess`）。训练、对局、自对弈全部走 Kit 的统一入口，
+本仓库只提供模型结构、批量评估器、训练任务与两个配方配置：
+
 ```bash
-./run_tests.sh                                  # 全套验收
-./data/download_mt.sh <url> <out> 8             # 多连接下载（每块 10 分钟超时重启）
-.venv/bin/python data/build_evals.py --out data/shards_evals
-./data/ship_shards.sh                           # 压缩后送到 GPU 机
+cd ~/UniChess
 
-# GPU 机上
-python unichess_r/model/train.py --data data/shards_evals --preset medium --device cuda --batch 1024
+# 单测（纯结构/契约部分本机可跑，权重相关部分远端自动跑）
+python -m unittest ResNet.tests.test_r2 -v
 
-# 引擎（UNICHESS_MCTS>0 启用搜索）
-UNICHESS_CKPT=runs/xxx/ckpt.pt UNICHESS_MCTS=800 ./unichess.sh
+# 训练（两个配方即旧 train.py / train_iteration_fast.py 的复刻）
+python -m Kit train ResNet/configs/stage1.json
+python -m Kit train ResNet/configs/iteration46.json      # 中断后原目录可续跑
 
-# 评测
-.venv/bin/python eval/arena.py --engine-a ./unichess.sh --engine-b tools/stockfish \
-  --nodes-b 5000 --pairs 100
+# 数据构建（evals 分片由 Kit/planes19/build 提供）
+python -m Kit data evals --help
+
+# 对局评测（kit 的 C++ PUCT 负责搜索；开局 / 裁决 / 统计见 Kit/pipelines/match.py）
+python -m Kit uci ResNet/engine.py --preset fast        # 通用 UCI 前端
 ```
+
+Server 侧无需手动起引擎：`models/R` 是指向本仓库的符号链接，`engine.py` 里的
+`KIT_FACTORY="ResNet.kit:make_player_factory"` 让 kit 包装六方法，`config.json`
+的四个预设（`max_mcts` / `fast` / `policy` / `cpu`）名不变。
 
 
 ## 第一个真实 Elo 基线（2026-09-08）
